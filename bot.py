@@ -2,10 +2,9 @@ import os
 import random
 import json
 import subprocess
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# توکن از متغیرهای محیطی خوانده می‌شود (امنیت بالا)
 TOKEN = os.environ.get("BOT_TOKEN")
 SCORES_FILE = "scores.json"
 
@@ -28,13 +27,12 @@ def load_scores():
 def save_scores(scores):
     with open(SCORES_FILE, "w", encoding="utf-8") as f:
         json.dump(scores, f, ensure_ascii=False, indent=2)
-    # --- بخش جدید: کامیت خودکار فایل امتیازها به گیت‌هاب ---
     try:
-        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
-        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True)
-        subprocess.run(["git", "add", SCORES_FILE], check=True)
-        subprocess.run(["git", "commit", "-m", "Update scores"], check=True)
-        subprocess.run(["git", "push"], check=True)
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True, capture_output=True)
+        subprocess.run(["git", "add", SCORES_FILE], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Update scores"], check=True, capture_output=True)
+        subprocess.run(["git", "push"], check=True, capture_output=True)
     except Exception as e:
         print(f"خطا در ذخیره‌سازی در گیت‌هاب: {e}")
 
@@ -56,13 +54,39 @@ def add_win(user_id, name):
     return scores[uid]
 
 # ---------- منطق بازی ----------
-def move_player(pos, roll):
-    new_pos = pos + roll
-    if new_pos > 100:
-        return pos
-    if new_pos in SNAKES_AND_LADDERS:
-        new_pos = SNAKES_AND_LADDERS[new_pos]
-    return new_pos
+def get_keyboard():
+    keyboard = [[InlineKeyboardButton("🎲 انداختن تاس", callback_data="roll_dice")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def build_scoreboard(chat_id):
+    players = games[chat_id]["players"]
+    # مرتب‌سازی بر اساس موقعیت
+    sorted_players = sorted(players.values(), key=lambda x: x["pos"], reverse=True)
+    board = "📊 **جدول موقعیت‌ها:**\n"
+    for p in sorted_players:
+        board += f"👤 {p['name']}: خانه {p['pos']}\n"
+    return board
+
+async def timeout_turn(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    if chat_id not in games or games[chat_id]["state"] != "playing":
+        return
+    current_id = games[chat_id]["order"][games[chat_id]["turn_index"]]
+    current_name = games[chat_id]["players"][current_id]["name"]
+    
+    # رفتن به نفر بعدی
+    games[chat_id]["turn_index"] = (games[chat_id]["turn_index"] + 1) % len(games[chat_id]["order"])
+    next_id = games[chat_id]["order"][games[chat_id]["turn_index"]]
+    next_name = games[chat_id]["players"][next_id]["name"]
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⏰ زمان {current_name} تمام شد! نوبت به {next_name} رسید.",
+        reply_markup=get_keyboard()
+    )
+    # زمان‌سنج جدید برای نفر بعدی
+    context.job_queue.run_once(timeout_turn, 30, chat_id=chat_id, name=str(chat_id))
 
 async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -72,6 +96,12 @@ async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in games and games[chat_id]["state"] == "playing":
         await update.message.reply_text("یک بازی در جریان است!")
         return
+        
+    # پاک کردن زمان‌سنج‌های قبلی
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
     games[chat_id] = {"players": {}, "order": [], "turn_index": 0, "state": "signup"}
     await update.message.reply_text(
         "🎲 بازی مار و پله شروع شد!\n"
@@ -107,52 +137,87 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     games[chat_id]["turn_index"] = 0
     first_id = games[chat_id]["order"][0]
     first_name = games[chat_id]["players"][first_id]["name"]
-    await update.message.reply_text(f"🎮 بازی شروع شد!\nنوبت اول: {first_name}\n/roll بزنید.")
+    
+    await update.message.reply_text(
+        f"🎮 بازی شروع شد!\nنوبت اول: {first_name} (۳۰ ثانیه فرصت داری!)\n",
+        reply_markup=get_keyboard()
+    )
+    
+    # شروع زمان‌سنج
+    context.job_queue.run_once(timeout_turn, 30, chat_id=chat_id, name=str(chat_id))
 
-async def roll_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+async def handle_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = query.message.chat_id
+    user = query.from_user
+
     if chat_id not in games or games[chat_id]["state"] != "playing":
-        await update.message.reply_text("بازی فعالی وجود ندارد.")
+        await query.edit_message_text("بازی فعالی وجود ندارد.")
         return
     if user.id not in games[chat_id]["players"]:
-        await update.message.reply_text("شما در این بازی نیستید!")
+        await query.answer("شما در این بازی نیستید!", show_alert=True)
         return
+        
     current_id = games[chat_id]["order"][games[chat_id]["turn_index"]]
     if user.id != current_id:
         current_name = games[chat_id]["players"][current_id]["name"]
-        await update.message.reply_text(f"نوبت شما نیست! نوبت {current_name} است.")
+        await query.answer(f"نوبت شما نیست! نوبت {current_name} است.", show_alert=True)
         return
+
+    # حذف زمان‌سنج فعلی چون تاس انداخت
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
 
     roll = random.randint(1, 6)
     player = games[chat_id]["players"][user.id]
     old_pos = player["pos"]
-    new_pos = move_player(old_pos, roll)
-    player["pos"] = new_pos
-
-    msg = f"🎲 {user.first_name} تاس {roll} آورد و از {old_pos} به {new_pos} رفت."
-    if new_pos in SNAKES_AND_LADDERS and old_pos + roll in SNAKES_AND_LADDERS:
-        if SNAKES_AND_LADDERS[old_pos + roll] > old_pos + roll:
-            msg += " 🪜 پله!"
+    new_pos = old_pos + roll
+    
+    msg = f"🎲 {user.first_name} تاس {roll} آورد.\n"
+    
+    if new_pos > 100:
+        msg += f"❌ نیاز به دقیقاً {100 - old_pos} بود. سر جایت ماندی.\n"
+        new_pos = old_pos
+    elif new_pos in SNAKES_AND_LADDERS:
+        if SNAKES_AND_LADDERS[new_pos] > new_pos:
+            msg += f"🪜 پله! از {new_pos} پریدی به {SNAKES_AND_LADDERS[new_pos]}.\n"
         else:
-            msg += " 🐍 مار!"
+            msg += f"🐍 مار! از {new_pos} سقوط کردی به {SNAKES_AND_LADDERS[new_pos]}.\n"
+        new_pos = SNAKES_AND_LADDERS[new_pos]
+    else:
+         msg += f"➡️ از {old_pos} به {new_pos} رفتی.\n"
+
+    player["pos"] = new_pos
 
     if new_pos == 100:
         games[chat_id]["state"] = "ended"
         updated = add_win(user.id, user.first_name)
         level = get_level(updated["points"])
-        await update.message.reply_text(
-            msg + f"\n\n🏆 {user.first_name} برنده شد!\n"
+        await query.edit_message_text(
+            msg + f"\n🏆 {user.first_name} برنده شد!\n"
             f"➕ ۱۰ امتیاز گرفت.\n"
-            f"مجموع امتیاز: {updated['points']} | سطح: {level}"
+            f"مجموع: {updated['points']} | سطح: {level}"
         )
         return
 
+    # رفتن به نفر بعدی
     games[chat_id]["turn_index"] = (games[chat_id]["turn_index"] + 1) % len(games[chat_id]["order"])
     next_id = games[chat_id]["order"][games[chat_id]["turn_index"]]
     next_name = games[chat_id]["players"][next_id]["name"]
-    await update.message.reply_text(msg + f"\n\nنوبت: {next_name}")
+    
+    board = build_scoreboard(chat_id)
+    msg += f"\n{board}\n"
+    msg += f"⏳ نوبت: {next_name} (۳۰ ثانیه)"
+    
+    await query.edit_message_text(msg, reply_markup=get_keyboard())
+    
+    # شروع زمان‌سنج برای نفر بعدی
+    context.job_queue.run_once(timeout_turn, 30, chat_id=chat_id, name=str(chat_id))
 
+# ---------- دستورات امتیاز ----------
 async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     scores = load_scores()
@@ -176,11 +241,15 @@ async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("newgame", new_game))
     app.add_handler(CommandHandler("join", join_game))
     app.add_handler(CommandHandler("start_game", start_game))
-    app.add_handler(CommandHandler("roll", roll_dice))
     app.add_handler(CommandHandler("myscore", my_score))
     app.add_handler(CommandHandler("top", top_players))
-    print("ربات مار و پله در حال اجراست...")
+    
+    # هندلر برای دکمه شیشه‌ای
+    app.add_handler(CallbackQueryHandler(handle_roll, pattern="roll_dice"))
+    
+    print("ربات حرفه‌ای مار و پله در حال اجراست...")
     app.run_polling()
